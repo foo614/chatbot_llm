@@ -1,142 +1,80 @@
 import os
-import sys
-
-from flask import Flask, request
-from twilio.rest import Client
-from twilio.base.exceptions import TwilioException
-import requests
-import constants
-
+from flask import Flask, request, jsonify, session
 import openai
-from langchain.chains import ConversationalRetrievalChain, RetrievalQA
-from langchain.chat_models import ChatOpenAI
-from langchain.document_loaders import DirectoryLoader, TextLoader
-from langchain_community.embeddings import OpenAIEmbeddings
-from langchain.indexes import VectorstoreIndexCreator
-from langchain.indexes.vectorstore import VectorStoreIndexWrapper
-from langchain.llms import OpenAI
-from langchain.vectorstores import Chroma
+from twilio.rest import Client
+from twilio.twiml.messaging_response import MessagingResponse
+import uuid
 
-os.environ["OPENAI_API_KEY"] = constants.APIKEY
+openai.api_key = os.environ["OPENAI_API_KEY"]
 
 app = Flask(__name__)
+app.secret_key = str(uuid.uuid4())
 
-ACCOUNT_ID = 'ACb800f6cbfa419dda0fdea370ee91b0c8'
-TWILIO_TOKEN = 'bc57092f2a6249b5c379ee0786f59e2c'
-TWILIO_NUMBER = 'whatsapp:+14155238886'
-# ACCOUNT_ID = '38ffdbe01da3e2a46d2c074aeb7083c6'
+ACCOUNT_ID = os.environ["ACCOUNT_ID"]
+TWILIO_TOKEN = os.environ["TWILIO_TOKEN"]
+TWILIO_NUMBER = os.environ["TWILIO_NUMBER"]
 
 client = Client(ACCOUNT_ID, TWILIO_TOKEN)
 
-chat_history = []
-# Enable to save to disk & reuse the model (for repeated queries on the same data)
-PERSIST = False
+@app.route("/")
+def home():
+    return f"Connected : {os.getenv('OPENAI_API_KEY')}", 200
 
-query = None
-if len(sys.argv) > 1:
-  query = sys.argv[1]
+@app.errorhandler(404)
+def page_not_found(e):
+    return jsonify({"status": 404, "message": "Not Found"}), 404
 
-if PERSIST and os.path.exists("persist"):
-  print("Reusing index...\n")
-  vectorstore = Chroma(persist_directory="persist", embedding_function=OpenAIEmbeddings())
-  index = VectorStoreIndexWrapper(vectorstore=vectorstore)
-else:
-  #loader = TextLoader("data/data.txt") # Use this line if you only need data.txt
-  loader = DirectoryLoader("data/")
-  if PERSIST:
-    index = VectorstoreIndexCreator(vectorstore_kwargs={"persist_directory":"persist"}).from_loaders([loader])
-  else:
-    index = VectorstoreIndexCreator().from_loaders([loader])
-
-chain = ConversationalRetrievalChain.from_llm(
-  llm=ChatOpenAI(model="gpt-3.5-turbo"),
-  retriever=index.vectorstore.as_retriever(search_kwargs={"k": 1}),
-)
-
-global active
-
-active = True
 @app.route('/whatsapp/webhook', methods=['POST'])
 def handle_whatsapp_webhook():
-    global active
-
     message = request.values['Body']
-    response = ""
+    from_number = request.values['From']
+
+    if "chat_mode" not in session:
+        session["chat_mode"] = "bot"
 
     if "/switch" in message.lower():
-        active = not active
-        text = "BOT" if active else "AGENT"
-        response = f"Switching to {text} mode."
-    elif active:
-        result = chain({"question": message, "chat_history": chat_history})
-        response = result['answer']
-        chat_history.append((query, response))
-    else:
-        response = "ChatGPT service is currently deactivated."
+        # Switching logic here if needed
+        session["chat_mode"] = 'human' if session["chat_mode"] == 'bot' else 'bot'
+        if session["chat_mode"] == 'bot':
+            response = "Bot mode is active. Please type /switch to switch to human mode."
+        else:
+            response = "Human mode is active. Please type /switch to switch to bot mode."
+        send_whatsapp_message(from_number, response )
+    
+    print(session["chat_mode"])
+    # only apply openai chat if the mode == BOT
+    if session["chat_mode"] == 'bot':
+        # Initialize or get the message history from session state
+        if "message_history" not in session:
+            session["message_history"] = [
+                {"role": "assistant", "content": "Good day to you! Welcome to Lux Retreats! Thank you for your interest in our villas 🤩 We have two villas available, The Black Box Villa and The White Box Villa 🏘️ Both villas are conveniently located next to each other. Our clients have the option to rent them individually for small gatherings or book both villas for larger events. Please find the pricing details below"}
+            ]
+        message_history = session["message_history"]
 
-    send_whatsapp_message(request.values['From'], response)
+        # Add the user's message to the message history
+        message_history.append({"role": "user", "content": message})
 
-    # Return a success response to Twilio
+        response = openai.ChatCompletion.create(
+            model = 'gpt-3.5-turbo-1106',
+            temperature = 1,
+            messages = message_history
+        )
+        # Format the ChatGPT response
+        chat_response = response["choices"][0]["message"]["content"]
+
+        # Add the ChatGPT response to the message history
+        message_history.append({"role": "assistant", "content": chat_response})
+        print(message_history)
+        send_whatsapp_message(from_number, chat_response )
+
     return "200 OK"
 
-def check_if_agent_message(message):
-    # Implement your logic to check if the message is from an agent
-    # For example, you could check for specific keywords or patterns in the message
-    return "agent" in message.lower()
-
 def send_whatsapp_message(to_number, message):
-    account_sid = ACCOUNT_ID
-    auth_token = TWILIO_TOKEN
-    client = Client(account_sid, auth_token)
-    message1 = client.messages.create(
-            from_='whatsapp:+14155238886',
-            body=message,
-            to=to_number
-            # to='whatsapp:+60187912826'
-        )
-    print(message1.sid)
-
-def get_stock_price(stock_symbol):
-   url = f"http://api.marketstack.com/v1/tickers/{stock_symbol}/eod"
-   params = {
-       "access_key": ACCOUNT_ID
-   }
-   response = requests.get(url, params=params)
-   data = response.json()
-   print(data["data"]['eod'][0]['close'])
-   return data["data"]['eod'][0]['close']
-
-def get_response_message(message):
-    # url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=AIzaSyDaFcyEmqJEn_NMNyAUkztPHOxgYL-uSHk"
-    headers = {
-    'Content-Type': 'application/json',
-    }
-
-    params = {
-        'key': 'AIzaSyDaFcyEmqJEn_NMNyAUkztPHOxgYL-uSHk',
-    }
-
-    json_data = {
-        'contents': [
-            {
-                'parts': [
-                    {
-                        'text': message,
-                    },
-                ],
-            },
-        ],
-    }
-
-    response = requests.post(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent',
-        params=params,
-        headers=headers,
-        json=json_data,
+    client.messages.create(
+        from_=TWILIO_NUMBER,
+        body=message,
+        to=to_number
     )
-    data = response.json()
-    return data['candidates'][0]['content']['parts'][0]['text']
-
 
 if __name__ == '__main__':
-   app.run()
+    app.run(debug=True)
